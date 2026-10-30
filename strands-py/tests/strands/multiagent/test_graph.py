@@ -3983,6 +3983,108 @@ class TestResumeDispatchedSibling:
         assert "From right:" in join_input_text
 
 
+def _build_revisit_loop_graph(visit_log, max_node_executions=20):
+    """Build s -> a -> b where b loops back to a until b has run twice, then continues to z.
+
+    Visits are counted in ``visit_log`` rather than in graph state, so the count survives a restore into a new graph.
+    """
+    builder = GraphBuilder()
+    for name in ("s", "a", "b", "z"):
+        builder.add_node(create_mock_agent(name, name), name)
+    builder.add_edge("s", "a")
+    builder.add_edge("a", "b")
+    builder.add_edge("b", "a", condition=lambda _: visit_log.count("b") < 2)
+    builder.add_edge("b", "z", condition=lambda _: visit_log.count("b") >= 2)
+    builder.set_entry_point("s")
+    builder.set_max_node_executions(max_node_executions)
+    graph = builder.build()
+    graph.add_hook(lambda event: visit_log.append(event.node_id), BeforeNodeCallEvent)
+    return graph
+
+
+class TestResumeInsideLoop:
+    """Verify a checkpoint taken after every node of a loop has completed resumes inside the loop (#5671)."""
+
+    @pytest.mark.parametrize(
+        ("hook_event", "checkpoint_node_id", "checkpoint_visit"),
+        [
+            # b finished its first visit; the revisit of a is not dispatched yet.
+            (AfterNodeCallEvent, "b", 1),
+            # The revisit of a is executing although a is already in completed_nodes from its first visit.
+            (BeforeNodeCallEvent, "a", 2),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_resume_continues_loop_instead_of_restarting(self, hook_event, checkpoint_node_id, checkpoint_visit):
+        visit_log: list[str] = []
+        graph = _build_revisit_loop_graph(visit_log)
+        captured: dict = {}
+
+        def capture(event):
+            if (
+                event.node_id == checkpoint_node_id
+                and visit_log.count(checkpoint_node_id) == checkpoint_visit
+                and "payload" not in captured
+            ):
+                captured["payload"] = event.source.serialize_state()
+                captured["visit_log"] = list(visit_log)
+
+        graph.add_hook(capture, hook_event)
+
+        await graph.invoke_async("loop task")
+
+        assert "payload" in captured
+
+        resumed_visit_log = captured["visit_log"]
+        visits_before_resume = len(resumed_visit_log)
+        resumed_graph = _build_revisit_loop_graph(resumed_visit_log)
+        resumed_graph.deserialize_state(captured["payload"])
+        result = await resumed_graph.invoke_async("loop task")
+
+        tru_status = result.status
+        exp_status = Status.COMPLETED
+        assert tru_status == exp_status
+
+        tru_resumed_node_ids = resumed_visit_log[visits_before_resume:]
+        exp_resumed_node_ids = ["a", "b", "z"]
+        assert tru_resumed_node_ids == exp_resumed_node_ids
+
+        tru_node_ids = [node.node_id for node in result.execution_order]
+        exp_node_ids = ["s", "a", "b", "a", "b", "z"]
+        assert tru_node_ids == exp_node_ids
+
+    def test_serialize_after_loop_hits_execution_limit_resets_on_deserialize(self):
+        visit_log: list[str] = []
+        graph = _build_revisit_loop_graph(visit_log, max_node_executions=3)
+        graph("loop task")
+
+        payload = graph.serialize_state()
+
+        tru_status = payload["status"]
+        exp_status = "failed"
+        assert tru_status == exp_status
+
+        tru_next_nodes = payload["next_nodes_to_execute"]
+        exp_next_nodes = []
+        assert tru_next_nodes == exp_next_nodes
+
+    def test_serialize_after_loop_completes_resets_on_deserialize(self):
+        visit_log: list[str] = []
+        graph = _build_revisit_loop_graph(visit_log)
+        graph("loop task")
+
+        payload = graph.serialize_state()
+
+        tru_next_nodes = payload["next_nodes_to_execute"]
+        exp_next_nodes = []
+        assert tru_next_nodes == exp_next_nodes
+
+        resumed_graph = _build_revisit_loop_graph(visit_log)
+        resumed_graph.deserialize_state(payload)
+
+        assert resumed_graph._resume_from_session is False
+
+
 def _failing_after_sibling_interrupts(name, sibling_interrupted):
     """Mock agent whose stream raises once the sibling node in the batch has interrupted."""
     agent = create_mock_agent(name)

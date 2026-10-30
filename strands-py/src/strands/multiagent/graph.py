@@ -1411,16 +1411,39 @@ class Graph(MultiAgentBase):
         ready_nodes: list[GraphNode] = []
         completed_nodes = set(self.state.completed_nodes)
         pending_sources = self._compute_pending_sources(completed_nodes)
+        last_run_index = {node: index for index, node in enumerate(self.state.execution_order)}
+        run_finished = self.state.status in (Status.COMPLETED, Status.FAILED)
         for node in self.nodes.values():
-            if node in completed_nodes:
-                continue
             incoming = [edge for edge in self.edges if edge.to_node is node]
+            if node in completed_nodes and (
+                run_finished or not self._is_revisit_pending(node, incoming, last_run_index)
+            ):
+                continue
             if not incoming:
                 ready_nodes.append(node)
             elif self._is_node_ready_for_resume(node, incoming, completed_nodes, pending_sources):
                 ready_nodes.append(node)
 
         return ready_nodes
+
+    def _is_revisit_pending(
+        self, node: "GraphNode", incoming: list[GraphEdge], last_run_index: dict["GraphNode", int]
+    ) -> bool:
+        """Return whether a completed node still has to run again, as happens when a cycle loops back to it.
+
+        A completed node runs again if it is in flight (a revisit that had started) or if a source that completed
+        after the node's latest run still has a traversable edge into it. Without this, a loop in which every node
+        has already completed once would look like a finished graph on resume.
+        """
+        if node.execution_status in (Status.EXECUTING, Status.DISPATCHED):
+            return True
+        node_index = last_run_index.get(node, -1)
+        return any(
+            edge.from_node in self.state.completed_nodes
+            and last_run_index.get(edge.from_node, -1) > node_index
+            and self._is_edge_traversable(edge)
+            for edge in incoming
+        )
 
     def _is_edge_traversable(self, edge: GraphEdge) -> bool:
         """Return whether an edge should be followed under the in-memory invocation state.
