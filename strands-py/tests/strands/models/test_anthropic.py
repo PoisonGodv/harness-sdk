@@ -1489,6 +1489,53 @@ def test_format_request_filters_location_source_document(model, model_id, max_to
     assert "Location sources are not supported by Anthropic" in caplog.text
 
 
+def test_format_request_filters_location_source_document_in_tool_result(model, caplog):
+    """Test that location-source documents inside a tool result are skipped with a warning."""
+    caplog.set_level(logging.WARNING, logger="strands.models.anthropic")
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "t1",
+                        "status": "success",
+                        "content": [
+                            {"text": "fetched"},
+                            {
+                                "document": {
+                                    "format": "pdf",
+                                    "name": "report.pdf",
+                                    "source": {"location": {"type": "s3", "uri": "s3://my-bucket/report.pdf"}},
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+        },
+    ]
+
+    tru_request = model.format_request(messages)
+
+    exp_messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "is_error": False,
+                    "content": [{"type": "text", "text": "fetched"}],
+                },
+            ],
+        },
+    ]
+    assert tru_request["messages"] == exp_messages
+    assert "Location sources are not supported by Anthropic" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_stream_message_stop_no_pydantic_warnings(anthropic_client, model, alist):
     """Verify no Pydantic serialization warnings are emitted for message_stop events.

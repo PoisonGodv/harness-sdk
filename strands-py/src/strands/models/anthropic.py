@@ -309,14 +309,18 @@ class AnthropicModel(Model):
             }
 
         if "toolResult" in content:
-            formatted_results = [
-                self._format_request_message_content(
-                    {"text": json.dumps(tool_result_content["json"], ensure_ascii=False)}
-                    if "json" in tool_result_content
-                    else cast(ContentBlock, tool_result_content)
+            formatted_results = []
+            for tool_result_content in content["toolResult"]["content"]:
+                if _has_location_source(cast(ContentBlock, tool_result_content)):
+                    logger.warning("Location sources are not supported by Anthropic | skipping content block")
+                    continue
+                formatted_results.append(
+                    self._format_request_message_content(
+                        {"text": json.dumps(tool_result_content["json"], ensure_ascii=False)}
+                        if "json" in tool_result_content
+                        else cast(ContentBlock, tool_result_content)
+                    )
                 )
-                for tool_result_content in content["toolResult"]["content"]
-            ]
             return {
                 "content": [block for block in formatted_results if block is not None],
                 "is_error": content["toolResult"]["status"] == "error",

@@ -258,6 +258,9 @@ class OpenAIModel(Model):
                 else:
                     merged.append({"type": "text", "text": content_block["text"]})
             elif "image" in content_block or "document" in content_block:
+                if _has_location_source(content_block):
+                    logger.warning("Location sources are not supported by OpenAI | skipping content block")
+                    continue
                 has_non_text = True
                 merged.append(cls.format_request_message_content(content_block))
 

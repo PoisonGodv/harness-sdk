@@ -2077,6 +2077,40 @@ def test_format_request_filters_location_source_document(model, caplog):
     assert "Location sources are not supported by OpenAI" in caplog.text
 
 
+def test_format_request_filters_location_source_document_in_tool_result(model, caplog):
+    """Test that location-source documents inside a tool result are skipped with a warning."""
+    caplog.set_level(logging.WARNING, logger="strands.models.openai")
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "t1",
+                        "status": "success",
+                        "content": [
+                            {"text": "fetched"},
+                            {
+                                "document": {
+                                    "format": "pdf",
+                                    "name": "report.pdf",
+                                    "source": {"location": {"type": "s3", "uri": "s3://my-bucket/report.pdf"}},
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+        },
+    ]
+
+    request = model.format_request(messages)
+
+    assert request["messages"] == [{"role": "tool", "tool_call_id": "t1", "content": "fetched"}]
+    assert "Location sources are not supported by OpenAI" in caplog.text
+
+
 def test_format_request_messages_with_tool_calls_no_content():
     """Test that assistant messages with only tool calls are included and have no content field."""
     messages = [
