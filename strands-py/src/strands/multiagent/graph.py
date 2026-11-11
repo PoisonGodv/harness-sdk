@@ -71,6 +71,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_GRAPH_ID = "default_graph"
+_GRAPH_BATCH_STATE_VERSION = 1
 
 
 class EdgeConditionWithContext(Protocol):
@@ -567,6 +568,7 @@ class Graph(MultiAgentBase):
                 self._plugin_registry.add_and_init(plugin)
 
         self._resume_next_nodes: list[GraphNode] = []
+        self._current_batch: list[GraphNode] = []
         self._resume_from_session = False
         self._current_invocation_state: dict[str, Any] = {}
         self._current_invocation_context = _create_invocation_context()
@@ -685,6 +687,10 @@ class Graph(MultiAgentBase):
         # Initialize state
         start_time = time.time()
         if not self._resume_from_session and not self._interrupt_state.activated:
+            self._current_batch.clear()
+            # Node statuses can outlive a cancelled invocation; they cannot seed its successor's frontier.
+            for node in self.nodes.values():
+                node.execution_status = Status.PENDING
             # Initialize state
             self.state = GraphState(
                 status=Status.EXECUTING,
@@ -744,6 +750,7 @@ class Graph(MultiAgentBase):
                 )
                 self._resume_from_session = False
                 self._resume_next_nodes.clear()
+                self._current_batch.clear()
 
             result = self._build_result(interrupts)
             yield MultiAgentResultEvent(result=result).as_dict()
@@ -821,6 +828,8 @@ class Graph(MultiAgentBase):
 
         elif self._resume_from_session:
             ready_nodes = self._resume_next_nodes
+            if all(node.execution_status == Status.COMPLETED for node in self._current_batch):
+                self._current_batch.clear()
 
         else:
             ready_nodes = list(self.entry_points)
@@ -836,11 +845,17 @@ class Graph(MultiAgentBase):
                 logger.debug("reason=<%s> | stopping execution", reason)
                 return  # Let the top-level exception handler deal with it
 
-            current_batch = ready_nodes.copy()
+            if self._resume_from_session and self._current_batch:
+                current_batch = self._current_batch.copy()
+                nodes_to_execute = ready_nodes.copy()
+            else:
+                current_batch = ready_nodes.copy()
+                nodes_to_execute = current_batch
             ready_nodes.clear()
+            self._current_batch = current_batch.copy()
 
             # Execute current batch
-            async for event in self._execute_nodes_parallel(current_batch, invocation_state):
+            async for event in self._execute_nodes_parallel(nodes_to_execute, invocation_state):
                 yield event
 
             if self.state.status == Status.INTERRUPTED:
@@ -867,6 +882,7 @@ class Graph(MultiAgentBase):
                     [node.node_id for node in newly_ready],
                 )
 
+            self._current_batch.clear()
             ready_nodes.extend(newly_ready)
 
     async def _execute_nodes_parallel(
@@ -1355,6 +1371,17 @@ class Graph(MultiAgentBase):
         """Serialize the current graph state to a dictionary."""
         compute_nodes = self._compute_ready_nodes_for_resume()
         next_nodes = [n.node_id for n in compute_nodes] if compute_nodes else []
+        internal_state: dict[str, Any] = {
+            "interrupt_state": self._interrupt_state.to_dict(),
+        }
+        if self.state.status == Status.EXECUTING and not self._interrupt_state.activated and self._current_batch:
+            internal_state["batch_state"] = {
+                "version": _GRAPH_BATCH_STATE_VERSION,
+                "member_ids": [node.node_id for node in self._current_batch],
+                "completed_member_ids": [
+                    node.node_id for node in self._current_batch if node.execution_status == Status.COMPLETED
+                ],
+            }
         return {
             "type": "graph",
             "id": self.id,
@@ -1370,20 +1397,17 @@ class Graph(MultiAgentBase):
             "accumulated_metrics": self.state.accumulated_metrics,
             "execution_count": self.state.execution_count,
             "execution_time": self._execution_time_with_active_interval(self.state.execution_time),
-            "_internal_state": {
-                "interrupt_state": self._interrupt_state.to_dict(),
-            },
+            "_internal_state": internal_state,
         }
 
     def deserialize_state(self, payload: dict[str, Any]) -> None:
         """Restore graph state from a session dict and prepare for execution.
 
         This method handles two scenarios:
-        1. If the graph execution ended (no next_nodes_to_execute and no interrupted nodes, eg: Completed, or Failed
-           with dead end nodes),
-        resets all nodes and graph state to allow re-execution from the beginning.
-        2. If the graph execution was interrupted mid-execution (has next_nodes_to_execute or interrupted nodes),
-           restores the persisted state and prepares to resume execution from the next ready nodes.
+        1. If the graph execution ended (no next_nodes_to_execute, interrupted nodes, or batch record, eg: Completed,
+           or Failed with dead end nodes), resets all nodes and graph state to allow re-execution from the beginning.
+        2. If the graph execution was interrupted mid-execution (has next_nodes_to_execute, interrupted nodes, or a
+           batch record), restores the persisted state and prepares to resume execution from the next ready nodes.
 
         Args:
             payload: Dictionary containing persisted state data including status,
@@ -1393,21 +1417,72 @@ class Graph(MultiAgentBase):
             internal_state = payload["_internal_state"]
             self._interrupt_state = _InterruptState.from_dict(internal_state["interrupt_state"])
 
-        if not payload.get("next_nodes_to_execute") and not payload.get("interrupted_nodes"):
+        batch_state = self._read_batch_state(payload)
+        if not payload.get("next_nodes_to_execute") and not payload.get("interrupted_nodes") and batch_state is None:
             # Reset all nodes
             for node in self.nodes.values():
                 node.reset_executor_state()
             # Reset graph state
             self.state = GraphState()
+            self._current_batch.clear()
             self._resume_from_session = False
             return
         else:
+            self._current_batch = []
             self._from_dict(payload)
+            if batch_state is not None:
+                self._restore_batch_state(*batch_state)
             self._resume_from_session = True
+
+    def _read_batch_state(self, payload: dict[str, Any]) -> tuple[list[GraphNode], set[GraphNode]] | None:
+        """Read a supported batch record, returning None for legacy or invalid payloads."""
+        if payload.get("status") != Status.EXECUTING.value or self._interrupt_state.activated:
+            return None
+        internal_state = payload.get("_internal_state")
+        if not isinstance(internal_state, dict):
+            return None
+        batch_state = internal_state.get("batch_state")
+        if not isinstance(batch_state, dict) or batch_state.get("version") != _GRAPH_BATCH_STATE_VERSION:
+            return None
+
+        member_ids = batch_state.get("member_ids")
+        completed_member_ids = batch_state.get("completed_member_ids")
+        if not isinstance(member_ids, list) or not isinstance(completed_member_ids, list):
+            return None
+        if not member_ids or not all(isinstance(node_id, str) for node_id in member_ids):
+            return None
+        if not all(isinstance(node_id, str) for node_id in completed_member_ids):
+            return None
+        if len(set(member_ids)) != len(member_ids) or len(set(completed_member_ids)) != len(completed_member_ids):
+            return None
+        if any(node_id not in self.nodes for node_id in member_ids):
+            return None
+        if not set(completed_member_ids).issubset(member_ids):
+            return None
+
+        members = [self.nodes[node_id] for node_id in member_ids]
+        completed_members = {self.nodes[node_id] for node_id in completed_member_ids}
+        return members, completed_members
+
+    def _restore_batch_state(self, members: list[GraphNode], completed_members: set[GraphNode]) -> None:
+        """Restore unfinished batch members and retain completed sources for routing."""
+        unfinished = [node for node in members if node not in completed_members]
+        self._current_batch = members
+        if not unfinished:
+            return
+        self._resume_next_nodes = unfinished
+        for node in unfinished:
+            node.execution_status = Status.PENDING
 
     def _compute_ready_nodes_for_resume(self) -> list[GraphNode]:
         if self.state.status == Status.PENDING:
             return []
+        if self.state.status == Status.EXECUTING and not self._interrupt_state.activated and self._current_batch:
+            unfinished = [node for node in self._current_batch if node.execution_status != Status.COMPLETED]
+            if unfinished:
+                return unfinished
+            return self._find_newly_ready_nodes(self._current_batch)
+
         ready_nodes: list[GraphNode] = []
         completed_nodes = set(self.state.completed_nodes)
         pending_sources = self._compute_pending_sources(completed_nodes)

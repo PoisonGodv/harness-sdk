@@ -1,4 +1,6 @@
 import asyncio
+import json
+import shutil
 import time
 import warnings
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
@@ -33,6 +35,7 @@ def _make_graph(
     graph._interrupt_state = interrupt_state or _InterruptState()
     graph._resume_from_session = False
     graph._resume_next_nodes = []
+    graph._current_batch = []
     graph.id = "test_graph"
     return graph
 
@@ -110,6 +113,339 @@ def create_mock_multi_agent(name, response_text="Multi-agent response"):
     multi_agent.stream_async = Mock(side_effect=mock_multi_stream_async)
     multi_agent.execute = Mock(return_value=mock_result)
     return multi_agent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("self_loop", [False, True], ids=["two-node-loop", "self-loop"])
+@pytest.mark.parametrize("sync_in_flight", [False, True], ids=["after-node-checkpoint", "in-flight-checkpoint"])
+@pytest.mark.parametrize("resync_before_resume", [False, True], ids=["direct-resume", "resaved-resume"])
+async def test_session_resumes_loop_revisit(tmp_path, self_loop, sync_in_flight, resync_before_resume):
+    """A file checkpoint resumes a pending loop visit without repeating the entry node (#5671)."""
+    storage_dir = tmp_path / "original"
+    checkpoint_dir = tmp_path / "checkpoint"
+    restored_dir = tmp_path / "restored"
+    revisit_started = asyncio.Event()
+    first_trace = []
+    resumed_trace = []
+
+    def build_graph(directory, trace, pause_on_revisit=False):
+        manager = FileSessionManager(session_id="loop", storage_dir=str(directory))
+        builder = GraphBuilder()
+        builder.set_max_node_executions(10)
+        names = ("s", "a", "z") if self_loop else ("s", "a", "b", "z")
+        for name in names:
+            agent = create_mock_agent(name, name)
+            original_stream = agent.stream_async
+
+            async def stream(*args, node_id=name, original=original_stream, **kwargs):
+                trace.append(node_id)
+                if pause_on_revisit and node_id == "a":
+                    visits = sum(node.node_id == "a" for node in graph.state.execution_order)
+                    if visits == 1:
+                        revisit_started.set()
+                        await asyncio.Event().wait()
+                async for event in original(*args, **kwargs):
+                    yield event
+
+            agent.stream_async = stream
+            builder.add_node(agent, name)
+        builder.add_edge("s", "a")
+        source = "a" if self_loop else "b"
+        if not self_loop:
+            builder.add_edge("a", "b")
+        builder.add_edge(
+            source, "a", condition=lambda state: sum(node.node_id == source for node in state.execution_order) < 2
+        )
+        builder.add_edge(
+            source, "z", condition=lambda state: sum(node.node_id == source for node in state.execution_order) >= 2
+        )
+        builder.set_entry_point("s")
+        builder.set_session_manager(manager)
+        graph = builder.build()
+        return graph, manager
+
+    graph, manager = build_graph(storage_dir, first_trace, pause_on_revisit=True)
+    running = asyncio.create_task(graph.invoke_async("go"))
+    try:
+        await asyncio.wait_for(revisit_started.wait(), timeout=5)
+        if sync_in_flight:
+            manager.sync_multi_agent(graph)
+        # Copy the actual checkpoint before cooperative cancellation can run final session hooks.
+        shutil.copytree(storage_dir, checkpoint_dir)
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+    tru_first_trace = first_trace
+    exp_first_trace = ["s", "a", "a"] if self_loop else ["s", "a", "b", "a"]
+    assert tru_first_trace == exp_first_trace
+
+    shutil.copytree(checkpoint_dir, restored_dir)
+    checkpoint = next(checkpoint_dir.rglob("multi_agent.json"))
+    payload = json.loads(checkpoint.read_text())
+    tru_order = payload["execution_order"]
+    exp_order = ["s", "a"] if self_loop else ["s", "a", "b"]
+    assert tru_order == exp_order
+
+    resumed, resumed_manager = build_graph(restored_dir, resumed_trace)
+    if resync_before_resume:
+        resumed_manager.sync_multi_agent(resumed)
+        resumed, _ = build_graph(restored_dir, resumed_trace)
+    result = await resumed.invoke_async("go")
+    tru_resume = {"trace": resumed_trace, "status": result.status}
+    exp_resume = {"trace": ["a", "z"] if self_loop else ["a", "b", "z"], "status": Status.COMPLETED}
+    assert tru_resume == exp_resume
+
+    tru_completed_frontier = resumed.serialize_state()["next_nodes_to_execute"]
+    exp_completed_frontier = []
+    assert tru_completed_frontier == exp_completed_frontier
+
+    failed_trace = []
+    limited, _ = build_graph(restored_dir, failed_trace)
+    limited.max_node_executions = 2 if self_loop else 3
+    limited_result = await limited.invoke_async("go")
+    tru_limited = {
+        "trace": failed_trace,
+        "status": limited_result.status,
+        "frontier": limited.serialize_state()["next_nodes_to_execute"],
+    }
+    exp_limited = {"trace": exp_order, "status": Status.FAILED, "frontier": []}
+    assert tru_limited == exp_limited
+
+    fresh_trace = []
+    fresh, _ = build_graph(restored_dir, fresh_trace)
+    fresh_result = await fresh.invoke_async("new run")
+    tru_fresh = {"trace": fresh_trace, "status": fresh_result.status}
+    exp_fresh = {"trace": exp_order + exp_resume["trace"], "status": Status.COMPLETED}
+    assert tru_fresh == exp_fresh
+
+
+@pytest.mark.asyncio
+async def test_session_waits_for_parallel_results_before_evaluating_revisit(tmp_path):
+    """Checkpointing cannot evaluate a back edge before its batch supplies the inputs (#5671)."""
+    right_started = asyncio.Event()
+    release_right = asyncio.Event()
+    builder = GraphBuilder()
+    builder.set_max_node_executions(10)
+    for name in ("root", "left", "right"):
+        agent = create_mock_agent(name)
+        original_stream = agent.stream_async
+
+        async def stream(*args, node_id=name, original=original_stream, **kwargs):
+            if node_id == "left":
+                await right_started.wait()
+            elif node_id == "right":
+                right_started.set()
+                await release_right.wait()
+            async for event in original(*args, **kwargs):
+                yield event
+
+        agent.stream_async = stream
+        builder.add_node(agent, name)
+    builder.add_edge("root", "left", condition=lambda state: state.execution_order.count(builder.nodes["root"]) < 2)
+    builder.add_edge("root", "right", condition=lambda state: state.execution_order.count(builder.nodes["root"]) < 2)
+    builder.add_edge("left", "root", condition=lambda state: state.results["right"].status == Status.COMPLETED)
+    builder.set_entry_point("root")
+    builder.set_session_manager(FileSessionManager(session_id="batch-condition", storage_dir=str(tmp_path)))
+    graph = builder.build()
+
+    def release_after_left(event):
+        if event.node_id == "left":
+            release_right.set()
+
+    graph.add_hook(release_after_left, AfterNodeCallEvent)
+    result = await asyncio.wait_for(graph.invoke_async("go"), timeout=5)
+    tru_run = {"status": result.status, "order": [node.node_id for node in result.execution_order]}
+    exp_run = {"status": Status.COMPLETED, "order": ["root", "left", "right", "root"]}
+    assert tru_run == exp_run
+
+
+@pytest.mark.asyncio
+async def test_session_resumes_unfinished_parallel_batch_before_revisit(tmp_path):
+    """A restored parallel batch finishes before a deferred loop revisit (#5671)."""
+    original_dir = tmp_path / "original"
+    checkpoint_dir = tmp_path / "checkpoint"
+    restored_dir = tmp_path / "restored"
+    right_started = asyncio.Event()
+    release_right = asyncio.Event()
+    left_checkpointed = asyncio.Event()
+    first_trace = []
+    resumed_trace = []
+
+    def build_graph(directory, trace, block_right=False):
+        manager = FileSessionManager(session_id="partial-batch", storage_dir=str(directory))
+        builder = GraphBuilder()
+        builder.set_max_node_executions(10)
+        for name in ("root", "left", "right"):
+            agent = create_mock_agent(name, name)
+            original_stream = agent.stream_async
+
+            async def stream(*args, node_id=name, original=original_stream, **kwargs):
+                trace.append(node_id)
+                if node_id == "right":
+                    right_started.set()
+                    if block_right:
+                        await release_right.wait()
+                elif node_id == "left":
+                    await right_started.wait()
+                async for event in original(*args, **kwargs):
+                    yield event
+
+            agent.stream_async = stream
+            builder.add_node(agent, name)
+        builder.add_edge("root", "left", condition=lambda state: state.execution_order.count(builder.nodes["root"]) < 2)
+        builder.add_edge(
+            "root", "right", condition=lambda state: state.execution_order.count(builder.nodes["root"]) < 2
+        )
+        builder.add_edge("left", "root", condition=lambda state: state.results["right"].status == Status.COMPLETED)
+        builder.set_entry_point("root")
+        builder.set_session_manager(manager)
+        graph = builder.build()
+
+        if block_right:
+
+            def mark_left_checkpointed(event):
+                if event.node_id == "left":
+                    left_checkpointed.set()
+
+            graph.add_hook(mark_left_checkpointed, AfterNodeCallEvent)
+        return graph, manager
+
+    graph, manager = build_graph(original_dir, first_trace, block_right=True)
+    running = asyncio.create_task(graph.invoke_async("go"))
+    try:
+        await asyncio.wait_for(left_checkpointed.wait(), timeout=5)
+        manager.sync_multi_agent(graph)
+        shutil.copytree(original_dir, checkpoint_dir)
+    finally:
+        release_right.set()
+        await asyncio.wait_for(running, timeout=5)
+
+    checkpoint = next(checkpoint_dir.rglob("multi_agent.json"))
+    payload = json.loads(checkpoint.read_text())
+    tru_checkpoint = {
+        "execution_order": payload["execution_order"],
+        "next_nodes_to_execute": payload["next_nodes_to_execute"],
+    }
+    exp_checkpoint = {"execution_order": ["root", "left"], "next_nodes_to_execute": ["right"]}
+    assert tru_checkpoint == exp_checkpoint
+
+    shutil.copytree(checkpoint_dir, restored_dir)
+    resumed, _ = build_graph(restored_dir, resumed_trace)
+    result = await asyncio.wait_for(resumed.invoke_async("go"), timeout=5)
+    tru_resume = {"trace": resumed_trace, "status": result.status}
+    exp_resume = {"trace": ["right", "root"], "status": Status.COMPLETED}
+    assert tru_resume == exp_resume
+
+    batch_state = payload["_internal_state"]["batch_state"]
+    tru_batch_state = {
+        "version": batch_state["version"],
+        "member_ids": set(batch_state["member_ids"]),
+        "completed_member_ids": set(batch_state["completed_member_ids"]),
+    }
+    exp_batch_state = {
+        "version": 1,
+        "member_ids": {"left", "right"},
+        "completed_member_ids": {"left"},
+    }
+    assert tru_batch_state == exp_batch_state
+
+
+@pytest.mark.asyncio
+async def test_serialize_state_preserves_parallel_cycle_frontier():
+    """Completed members of one batch can schedule each other's next visits (#5671)."""
+
+    def build_graph(trace):
+        builder = GraphBuilder()
+        builder.set_max_node_executions(10)
+        for name in ("root", "left", "right"):
+            agent = create_mock_agent(name)
+            original_stream = agent.stream_async
+
+            async def stream(*args, node_id=name, original=original_stream, **kwargs):
+                trace.append(node_id)
+                async for event in original(*args, **kwargs):
+                    yield event
+
+            agent.stream_async = stream
+            builder.add_node(agent, name)
+        builder.add_edge("root", "left")
+        builder.add_edge("root", "right")
+        builder.add_edge(
+            "left", "right", condition=lambda state: state.execution_order.count(builder.nodes["left"]) < 2
+        )
+        builder.add_edge(
+            "right", "left", condition=lambda state: state.execution_order.count(builder.nodes["right"]) < 2
+        )
+        builder.set_entry_point("root")
+        return builder.build()
+
+    graph = build_graph([])
+    checkpoint = {}
+
+    def capture_complete_batch(event):
+        if (
+            "payload" not in checkpoint
+            and len(event.source.state.execution_order) == 3
+            and all(node.execution_status == Status.COMPLETED for node in event.source.nodes.values())
+        ):
+            checkpoint["payload"] = event.source.serialize_state()
+
+    graph.add_hook(capture_complete_batch, AfterNodeCallEvent)
+    await graph.invoke_async("go")
+    tru_frontier = set(checkpoint["payload"]["next_nodes_to_execute"])
+    exp_frontier = {"left", "right"}
+    assert tru_frontier == exp_frontier
+    resumed_trace = []
+    resumed = build_graph(resumed_trace)
+    resumed.deserialize_state(checkpoint["payload"])
+    result = await resumed.invoke_async("go")
+    tru_run = {"trace": sorted(resumed_trace), "status": result.status}
+    exp_run = {"trace": ["left", "right"], "status": Status.COMPLETED}
+    assert tru_run == exp_run
+
+
+@pytest.mark.asyncio
+async def test_serialize_state_excludes_cancelled_previous_invocation_branch():
+    """A fresh invocation's checkpoint excludes an inactive branch from an earlier run (#5671)."""
+    old_branch_started = asyncio.Event()
+    builder = GraphBuilder()
+    builder.set_max_node_executions(10)
+    for name in ("root", "left", "right"):
+        agent = create_mock_agent(name)
+        original_stream = agent.stream_async
+
+        async def stream(*args, node_id=name, original=original_stream, **kwargs):
+            if node_id == "left":
+                old_branch_started.set()
+                await asyncio.Event().wait()
+            async for event in original(*args, **kwargs):
+                yield event
+
+        agent.stream_async = stream
+        builder.add_node(agent, name)
+    builder.add_edge("root", "left", condition=lambda state, *, invocation_state: invocation_state["branch"] == "left")
+    builder.add_edge(
+        "root", "right", condition=lambda state, *, invocation_state: invocation_state["branch"] == "right"
+    )
+    graph = builder.build()
+    running = asyncio.create_task(graph.invoke_async("go", invocation_state={"branch": "left"}))
+    try:
+        await asyncio.wait_for(old_branch_started.wait(), timeout=5)
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+    checkpoint = {}
+
+    def capture_fresh_root(event):
+        if event.node_id == "root":
+            checkpoint["payload"] = event.source.serialize_state()
+
+    graph.add_hook(capture_fresh_root, AfterNodeCallEvent)
+    await graph.invoke_async("go", invocation_state={"branch": "right"})
+    tru_frontier = checkpoint["payload"]["next_nodes_to_execute"]
+    exp_frontier = ["right"]
+    assert tru_frontier == exp_frontier
 
 
 @pytest.fixture
@@ -3645,6 +3981,32 @@ class TestResumeInFlightSibling:
     bypassed dead branch: join stays out of the resume frontier so a restore runs join exactly once,
     with both parents' outputs present, rather than double-running it and seeing incomplete inputs.
     """
+
+    @pytest.mark.parametrize("sibling_status", [Status.EXECUTING, Status.DISPATCHED])
+    def test_revisited_sibling_blocks_revisited_join(self, sibling_status):
+        """A previous result cannot satisfy the join while its producer is revisited (#5671)."""
+        builder = GraphBuilder()
+        builder.set_max_node_executions(10)
+        for name in ("root", "left", "right", "join"):
+            builder.add_node(create_mock_agent(name), name)
+        builder.add_edge("root", "left")
+        builder.add_edge("root", "right")
+        builder.add_edge("left", "join")
+        builder.add_edge("right", "join")
+        builder.add_edge("join", "left")
+        builder.add_edge("join", "right")
+        builder.set_entry_point("root")
+        graph = builder.build()
+        graph.state.status = Status.EXECUTING
+        graph.state.completed_nodes = set(graph.nodes.values())
+        for node in graph.nodes.values():
+            node.execution_status = Status.COMPLETED
+        graph.nodes["right"].execution_status = sibling_status
+        graph._current_batch = [graph.nodes["left"], graph.nodes["right"]]
+
+        tru_frontier = graph.serialize_state()["next_nodes_to_execute"]
+        exp_frontier = ["right"]
+        assert tru_frontier == exp_frontier
 
     def test_in_flight_sibling_excluded_from_resume_frontier(self):
         """join is excluded and right included when right is still executing at serialize time."""
